@@ -2,7 +2,6 @@ package mr
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"strconv"
 	"strings"
@@ -15,8 +14,7 @@ import "net/rpc"
 import "net/http"
 
 var (
-	AssignLock       sync.Mutex // 全局锁，在coordinator分配任务时加锁
-	MarkFinishedLock sync.Mutex // 全局锁，在coordinator修改任务状态时加锁
+	lock sync.Mutex // 全局锁
 )
 
 // TaskMetaInfo 所有任务在coordinator维护状态
@@ -30,8 +28,7 @@ type TaskMetaHolder struct {
 	MetaMap map[int]*TaskMetaInfo // taskId--> Task
 }
 
-// judgeStatus 判定任务的工作状态。正在工作返回false
-func (holder TaskMetaHolder) judgeStatus(taskID int) bool {
+func (holder TaskMetaHolder) changeStatus(taskID int) bool {
 	taskInfo, has := holder.MetaMap[taskID]
 	if !has || taskInfo.status != Waiting {
 		return false
@@ -43,30 +40,32 @@ func (holder TaskMetaHolder) judgeStatus(taskID int) bool {
 
 func (holder TaskMetaHolder) isTaskDone() bool {
 	var (
-		mapRunningNum    int = 0
-		mapDoneNum       int = 0
-		reduceRunningNum     = 0
-		reduceDoneNum        = 0
+		mapUndoneNum    int = 0
+		mapDoneNum      int = 0
+		reduceUndoneNum     = 0
+		reduceDoneNum       = 0
 	)
 	for _, t := range holder.MetaMap {
 		if t.TaskAdr.TaskType == MapTask {
 			if t.status == Done {
 				mapDoneNum++
-			} else if t.status == Running {
-				mapRunningNum++
+			} else {
+				mapUndoneNum++
 			}
 		} else if t.TaskAdr.TaskType == ReduceTask {
 			if t.status == Done {
 				reduceDoneNum++
-			} else if t.status == Running {
-				reduceRunningNum++
+			} else {
+				reduceUndoneNum++
 			}
 		}
 	}
-	if mapRunningNum == 0 && mapDoneNum > 0 && reduceRunningNum == 0 && reduceDoneNum == 0 {
+	fmt.Printf("Coordinator:[INFO]check task is done,mapRunning=%d,mapDone=%d,reduceRunning=%d,reduceDone=%d\n", mapUndoneNum, mapDoneNum, reduceUndoneNum, reduceDoneNum)
+
+	if mapUndoneNum == 0 && mapDoneNum > 0 && reduceUndoneNum == 0 && reduceDoneNum == 0 {
 		// map阶段运行完毕
 		return true
-	} else if reduceDoneNum > 0 && reduceRunningNum == 0 {
+	} else if reduceDoneNum > 0 && reduceUndoneNum == 0 {
 		// reduce阶段运行完毕
 		return true
 	}
@@ -79,8 +78,7 @@ func (holder TaskMetaHolder) acceptMeta(t *TaskMetaInfo) {
 }
 
 type Coordinator struct {
-	Status Status `json:"status"` // 整个mapreduce任务的状态，任务完成后，所有工作线程也可以退出
-	//mu             sync.Mutex
+	Status         Status `json:"status"` // 整个mapreduce任务的状态，任务完成后，所有工作线程也可以退出
 	MapChannel     chan *Task
 	ReduceChannel  chan *Task
 	Phase          TaskPhase
@@ -93,47 +91,50 @@ type Coordinator struct {
 
 // Your code here -- RPC handlers for the worker to call.
 
-//
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
-//
 func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
 
 func (c *Coordinator) AssignTask(args *TaskArgs, reply *Task) error {
-	fmt.Printf("[INFO]worker call coordinator for task")
 	// 整个过程加锁保证线程安全
-	AssignLock.Lock()
-	defer AssignLock.Unlock()
+	lock.Lock()
+	defer lock.Unlock()
+	fmt.Printf("Coordinator:[INFO]worker call coordinator for task,current phase is %v\n", c.Phase)
+
 	switch c.Phase {
 	case MapPhase:
 		if len(c.MapChannel) > 0 {
-			reply = <-c.MapChannel
-			// TODO 如果已分配的任务正在running 如何处理？
-			if !c.TaskMetaHolder.judgeStatus(reply.TaskID) {
-				fmt.Printf("[WARN] map-taskID[%d] is running", reply.TaskID)
-			}
+			// 从通道中取出的任务对象内容会被复制到 reply 所指向的对象中
+			*reply = *<-c.MapChannel
+			fmt.Printf("Coordinator:[DEBUG]AssignTask task from chan,current phase is map,taskID=%d,len(input)=%d\n", reply.TaskID, len(reply.Input))
+			c.TaskMetaHolder.changeStatus(reply.TaskID)
+			//	fmt.Printf("[WARN] map-taskID[%d] is running", reply.TaskID)
+			//}
 		} else {
 			// map任务分发完毕，等待任务执行
 			reply.TaskType = WaitingType
 			if c.TaskMetaHolder.isTaskDone() {
 				c.toNextPhase()
 			}
+			return nil
 		}
 	case ReducePhase:
 		if len(c.ReduceChannel) > 0 {
-			reply = <-c.ReduceChannel
-			if !c.TaskMetaHolder.judgeStatus(reply.TaskID) {
-				fmt.Printf("[WARN] reduce-taskID[%d] is running", reply.TaskID)
-			}
+			*reply = *<-c.ReduceChannel
+			fmt.Printf("Coordinator:[DEBUG]AssignTask task from chan,current phase is reduce,taskID=%d,len(input)=%d\n", reply.TaskID, len(reply.Input))
+			c.TaskMetaHolder.changeStatus(reply.TaskID)
+			//	fmt.Printf("[WARN] reduce-taskID[%d] is running", reply.TaskID)
+			//}
 		} else {
 			reply.TaskType = WaitingType
 			if c.TaskMetaHolder.isTaskDone() {
 				c.toNextPhase()
 			}
+			return nil
 		}
 	case AllDone:
 		reply.TaskType = ExitType
@@ -145,25 +146,25 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *Task) error {
 }
 
 func (c *Coordinator) MarkFinished(args *Task, reply *Task) error {
-	fmt.Printf("[INFO]worker call coordinator for Mark finish")
-	MarkFinishedLock.Lock()
-	defer MarkFinishedLock.Unlock()
+	fmt.Printf("Coordinator:[INFO]worker call coordinator for Mark finish,current taskType is %v,taskid=%d\n", args.TaskType, args.TaskID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	if args.TaskType == MapTask || args.TaskType == ReduceTask {
 		meta, ok := c.TaskMetaHolder.MetaMap[args.TaskID]
 		if ok && meta.status == Running {
 			meta.status = Done
 		} else {
-			fmt.Printf("[WARN]Map task Id[%d] is finished,already ! ! !\n", args.TaskID)
+			fmt.Printf("Coordinator:[WARN]Map task Id[%d] is finished,already ! ! !\n", args.TaskID)
 		}
 	} else {
 		panic("MarkFinished error,unknown taskType")
 	}
+
 	return nil
 }
 
-//
 // start a thread that listens for RPCs from worker.go
-//
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -171,20 +172,20 @@ func (c *Coordinator) server() {
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
-	fmt.Printf("[INFO]coordinator server alreay start...")
+	fmt.Printf("Coordinator:[INFO]coordinator server alreay start...\n")
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
 }
 
-//
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 // mrcoordinator.go will exit
-//
 func (c *Coordinator) Done() bool {
 	//ret := false
+	lock.Lock()
+	defer lock.Unlock()
 	if c.Phase == AllDone {
 		return true
 	}
@@ -193,6 +194,7 @@ func (c *Coordinator) Done() bool {
 
 // toNextPhase mapreduce的阶段切换
 func (c *Coordinator) toNextPhase() {
+	fmt.Printf("Coordinator:[INFO]change to next phase,current phase is %v\n", c.Phase)
 	if c.Phase == MapPhase {
 		c.makeReduceTasks()
 		c.Phase = ReducePhase
@@ -224,7 +226,7 @@ func (c *Coordinator) makeMapTasks(files []string) {
 		c.TaskMetaHolder.acceptMeta(&taskMetaInfo)
 		c.MapChannel <- &task
 	}
-	fmt.Printf("[INFO]push map task to channel,len(chan)=%d\n", len(c.MapChannel))
+	fmt.Printf("Coordinator:[INFO]push map task to channel,len(chan)=%d\n", len(c.MapChannel))
 }
 
 func (c *Coordinator) makeReduceTasks() {
@@ -233,7 +235,7 @@ func (c *Coordinator) makeReduceTasks() {
 		task := Task{
 			TaskType: ReduceTask,
 			TaskID:   id,
-			Input:    selectReduceFile(id),
+			Input:    selectReduceFile(i),
 		}
 		taskMetaInfo := TaskMetaInfo{
 			status:  Waiting,
@@ -244,26 +246,52 @@ func (c *Coordinator) makeReduceTasks() {
 	}
 }
 
-func selectReduceFile(id int) []string {
+func (c *Coordinator) CrashDetector() {
+	for {
+		time.Sleep(time.Second * 2)
+		lock.Lock()
+		if c.Phase == AllDone {
+			lock.Unlock()
+			break
+		}
+		for _, task := range c.TaskMetaHolder.MetaMap {
+			// 超时检测
+			if task.status == Running && time.Since(task.StartTime) > 9*time.Second {
+				fmt.Printf("Coordinator:[WARN]the task is crash,taskid=%d,taskType=%d\n", task.TaskAdr.TaskID, task.TaskAdr.TaskType)
+
+				if task.TaskAdr.TaskType == MapTask {
+					c.MapChannel <- task.TaskAdr
+					task.status = Waiting
+
+				}
+				if task.TaskAdr.TaskType == ReduceTask {
+					c.ReduceChannel <- task.TaskAdr
+					task.status = Waiting
+				}
+			}
+		}
+		lock.Unlock()
+	}
+}
+
+func selectReduceFile(reduceNum int) []string {
 	// 读取当前目录下所有文件
 	reduceFiles := []string{}
 	path, _ := os.Getwd()
-	files, _ := ioutil.ReadDir(path)
+	files, _ := os.ReadDir(path)
 	for _, file := range files {
 		// 根据文件名称匹配
 		if strings.HasPrefix(file.Name(), MAP_FILE_PREFIX) &&
-			strings.HasSuffix(file.Name(), strconv.Itoa(id)) {
+			strings.HasSuffix(file.Name(), strconv.Itoa(reduceNum)) {
 			reduceFiles = append(reduceFiles, file.Name())
 		}
 	}
 	return reduceFiles
 }
 
-//
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
-//
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		ReduceNum:     nReduce,
@@ -276,11 +304,13 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			MetaMap: make(map[int]*TaskMetaInfo, len(files)+nReduce),
 		},
 	}
-	fmt.Printf("[INFO]make map tasks by files,len(files)=%d\n", len(files))
+	fmt.Printf("Coordinator:[INFO]make map tasks by files,len(files)=%d\n", len(files))
 	c.makeMapTasks(files)
 	// Your code here.
 
 	c.server()
+
+	go c.CrashDetector()
 
 	return &c
 }

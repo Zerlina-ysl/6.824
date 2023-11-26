@@ -19,6 +19,7 @@ then
   fi
 fi
 
+# 判断系统中的超时命令
 TIMEOUT=timeout
 if timeout 2s sleep 1 > /dev/null 2>&1
 then
@@ -45,6 +46,7 @@ cd mr-tmp || exit 1
 rm -f mr-*
 
 # make sure software is freshly built.
+# 如果编译失败（返回值非零），则执行 exit 1 命令终止脚本
 (cd ../../mrapps && go clean)
 (cd .. && go clean)
 (cd ../../mrapps && go build $RACE -buildmode=plugin wc.go) || exit 1
@@ -78,10 +80,12 @@ pid=$!
 sleep 1
 
 # start multiple workers.
+# 启动三个worker进程
 $TIMEOUT ../mrworker ../../mrapps/wc.so &
 $TIMEOUT ../mrworker ../../mrapps/wc.so &
 $TIMEOUT ../mrworker ../../mrapps/wc.so &
 
+# 阻塞coordinator进程，无法响应worker进程
 # wait for the coordinator to exit.
 wait $pid
 

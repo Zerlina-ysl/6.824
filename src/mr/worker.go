@@ -18,9 +18,7 @@ const (
 	REDUCE_FILE_PREFIX = "mr-out-"
 )
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
@@ -31,19 +29,15 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-//
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
 	//  send an RPC to the coordinator asking for a task
@@ -51,33 +45,45 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
-	task := CallAssignTask()
-	fmt.Printf("[INFO]get task from coornator,taskID=%d,taskType=%v,len(task.file)=%d\n", task.TaskID, task.TaskType, len(task.Input))
-	switch task.TaskType {
-	case MapTask:
-		fmt.Println("-------------map----------------")
-		DoMapTask(mapf, &task)
-		MarkDone(&task)
-	case ReduceTask:
-		fmt.Println("-------------reduce----------------")
-		DoReduceTask(reducef, &task)
-		MarkDone(&task)
-	case WaitingType:
-		fmt.Println("-----------waitingType,sleep----------------")
-		time.Sleep(200 * time.Millisecond)
-	case ExitType:
-		time.Sleep(200 * time.Millisecond)
-		fmt.Println("-----------all task done------------------")
+	askFlag := true
+	for askFlag {
+		task := CallAssignTask()
+		fmt.Printf("[INFO]get task from coornator,taskID=%d,taskType=%v,len(task.file)=%d\n", task.TaskID, task.TaskType, len(task.Input))
+		switch task.TaskType {
+
+		case MapTask:
+			fmt.Println("-------------map----------------")
+			DoMapTask(mapf, &task)
+			MarkDone(&task)
+
+		case ReduceTask:
+			fmt.Println("-------------reduce----------------")
+			DoReduceTask(reducef, &task)
+			MarkDone(&task)
+
+		case WaitingType:
+			fmt.Println("-----------waitingType,sleep----------------")
+			time.Sleep(200 * time.Millisecond)
+
+		case ExitType:
+			time.Sleep(200 * time.Millisecond)
+			askFlag = false
+			fmt.Println("-----------all task done------------------")
+		}
+
 	}
+
+	time.Sleep(time.Second * 1)
 
 }
 
 func DoReduceTask(reducef func(string, []string) string, t *Task) {
 	// 对reduce任务要处理的中间键排序
+	fmt.Printf("Coordinator:[INFO] do reduce task,len(file)=%d", len(t.Input))
 	intermediate := sortKV(t.Input)
 	// 创建临时文件
 	dir, _ := os.Getwd()
-	tmpFile, _ := ioutil.TempFile(dir, "mr-tmp-*")
+	tmpFile, _ := ioutil.TempFile(dir, "mr-temp-*")
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -105,12 +111,8 @@ func DoReduceTask(reducef func(string, []string) string, t *Task) {
 func sortKV(input []string) []KeyValue {
 	var kva []KeyValue
 	for _, filename := range input {
-		file, err := os.Open(filename)
-		if err != nil {
-			log.Fatalf("[FATAL] cannot open %v", filename)
-		}
+		file, _ := os.Open(filename)
 		dec := json.NewDecoder(file)
-		file.Close()
 		for {
 			var kv KeyValue
 			if err := dec.Decode(&kv); err != nil {
@@ -118,6 +120,7 @@ func sortKV(input []string) []KeyValue {
 			}
 			kva = append(kva, kv)
 		}
+		file.Close()
 	}
 	sort.Sort(ByKey(kva))
 	return kva
@@ -165,11 +168,9 @@ func DoMapTask(mapf func(string, string) []KeyValue, t *Task) {
 	}
 }
 
-//
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
-//
 func CallExample() {
 
 	// declare an argument structure.
@@ -200,7 +201,7 @@ func CallAssignTask() Task {
 	ok := call("Coordinator.AssignTask", &args, &reply)
 	if ok {
 		// reply.Y should be 100.
-		fmt.Printf("[INFO] Coordinator.AssignTask task.id=%v\n", reply.TaskID)
+		fmt.Printf("[INFO] Coordinator.AssignTask task.id=%v,len(input)=%d\n", reply.TaskID, len(reply.Input))
 	} else {
 		fmt.Printf("[ERROR] Coordinator.AssignTask call failed!\n")
 	}
@@ -213,18 +214,16 @@ func MarkDone(t *Task) Task {
 	ok := call("Coordinator.MarkFinished", &args, &reply)
 	if ok {
 		// reply.Y should be 100.
-		fmt.Printf("[INFO] Coordinator.Done task.id=%v\n", t.TaskID)
+		fmt.Printf("Worker:[INFO] Coordinator.MarkFinished task.id=%v\n", t.TaskID)
 	} else {
-		fmt.Printf("[ERROR] Coordinator.Done call failed!\n")
+		fmt.Printf("Worker:[ERROR] Coordinator.MarkFinished call failed!\n")
 	}
 	return reply
 }
 
-//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
