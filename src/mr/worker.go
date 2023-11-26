@@ -101,7 +101,6 @@ func DoReduceTask(reducef func(string, []string) string, t *Task) {
 
 		i = j
 	}
-
 	tmpFile.Close()
 	// 写入成功后对临时文件重命名
 	fn := REDUCE_FILE_PREFIX + strconv.Itoa(t.TaskID)
