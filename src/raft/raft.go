@@ -79,6 +79,9 @@ type Raft struct {
 
 	commitIndex      int // logEntry中已被提交的命令行下标
 	lastAppliedIndex int // 上一个被提交的logEntry下标
+
+	nextIndex  []LogEntry
+	matchIndex []LogEntry
 }
 
 // 日志条目
