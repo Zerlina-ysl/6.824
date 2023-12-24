@@ -21,23 +21,31 @@ import (
 	//	"bytes"
 	"sync"
 	"sync/atomic"
-
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
 
+type RfType int
 
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in part 2D you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh, but set CommandValid to false for these
-// other uses.
-//
+const (
+	Follower RfType = iota
+	Candidater
+	Leader
+)
+
+/*
+		ApplyMsg
+
+	 as each Raft peer becomes aware that successive log entries are committed,
+
+the peer should send an ApplyMsg to the service (or tester) on the same server,
+via the applyCh passed to Make().
+set  CommandValid to true to indicate that the ApplyMsg contains a newly committed log entry.
+
+	in part 2D you'll want to send other kinds of messages (e.g., snapshots) on the applyCh,
+
+but set CommandValid to false for these other uses.
+*/
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -50,9 +58,7 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-//
 // A Go object implementing a single Raft peer.
-//
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -64,6 +70,21 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// status for leader election
+	currentTerm int // 当前任期
+	votedFor    int // 当前任期所投票的candidateID
+	logEntry    []LogEntry
+
+	rfType RfType
+
+	commitIndex      int // logEntry中已被提交的命令行下标
+	lastAppliedIndex int // 上一个被提交的logEntry下标
+}
+
+// 日志条目
+type LogEntry struct {
+	term    int // leader收到logEntry时的任期
+	command string
 }
 
 // return currentTerm and whether this server
@@ -76,11 +97,9 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-//
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -92,10 +111,7 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
-//
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -115,11 +131,8 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-//
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
-//
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
@@ -136,51 +149,110 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
-//
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
-//
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term         int // candidate的任期
+	candidateID  int // 请求被投票的candidate的id
+	lastLogIndex int // candidate最新一条日志条目索引
+	lastLogTerm  int // candidate最新一条日志条目被提交时的任期
 }
 
-//
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
-//
 type RequestVoteReply struct {
 	// Your data here (2A).
+	term        int  // 当前任期，candidate需要将该值更新为任期值
+	voteGranted bool // 接受者是否给自己投票
 }
 
-//
 // example RequestVote RPC handler.
-//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 }
 
-//
+type AppendEntriesArgs struct {
+	term         int
+	leaderID     int
+	prevLogIndex int // 最新处理的log entry索引
+	prevLogTerm  int // 最新处理的log entry提交时的term
+	entries      []LogEntry
+	leaderCommit int // leader提交索引
+}
+
+type AppendEntriesReply struct {
+	term    int
+	success bool // 如果follower包含的条目匹配preLogIndex和preLogTerm成功，返回true
+	err     status
+}
+
+// AppendEntries 复制log/心跳检测
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	// Your code here (2A, 2B).
+	// 只有leader可以发
+	if rf.rfType != Leader {
+		return
+	}
+	if rf.currentTerm > args.term {
+		// reply false is term<currentTerm
+		reply.success = false
+		// for leader to update itself
+		reply.term = rf.currentTerm
+		reply.err = AppendEntriesTermError
+		return
+	}
+	reply.term = args.term
+
+	if args.prevLogIndex == rf.getLastLogIndex() && args.prevLogTerm != args.entries[rf.getLastLogIndex()].term {
+		reply.success, reply.err = false, AppendEntriesLastLogError
+		return
+	}
+	rf.CorrectConflictIndex(args.entries)
+
+}
+func (rf *Raft) getLastLogIndex() int {
+	return len(rf.logEntry) - 1
+}
+
+// CorrectConflictIndex 修正logEntrysame index but different terms)
+func (rf *Raft) CorrectConflictIndex(entries []LogEntry) bool {
+	for _, entry := range entries {
+		for idx, rfEntry := range rf.logEntry {
+			if entry.logIndex == rfEntry.logTerm && entry.logIndex != rfEntry.logIndex {
+				// delete the existing entry and all that follow it
+				rf.logEntry[idx].logIndex = entry.logIndex
+			}
+			if entry.logIndex > rf.logEntry[idx].logIndex {
+
+			}
+		}
+	}
+	return true
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
+// fills in *reply with RPC reply, so caller should pass &reply.
+
 // the types of the args and reply passed to Call() must be
 // the same as the types of the arguments declared in the
 // handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
+
+// The labrpc package simulates a lossy network, in which servers may be unreachable,
+// and in which requests and replies may be lost.
+// Call() sends a request and waits for a reply.
+// If a reply arrives within a timeout interval, Call() returns true;
+// otherwise Call() returns false.
+// Thus Call() may not return for a while.
+// A false return can be caused by a dead server,
+// a live server that can't be reached, a lost request, or a lost reply.
+
 // Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
+// handler function on the server side does not return.
+// Thus there is no need to implement your own timeouts around Call().
 //
 // look at the comments in ../labrpc/labrpc.go for more details.
 //
@@ -188,39 +260,34 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
+/*
+	Start()
 
-//
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-//
+the service using Raft (e.g. a k/v server) wants to start agreement on the next command to be appended to Raft's log.
+if this server isn't the leader, returns false.
+otherwise start the agreement and return immediately.
+there is no guarantee that this command will ever be committed to the Raft log,
+since the leader  may fail or lose an election. even if the Raft instance has been killed, this function should return gracefully.
+return value:
+
+	1.index that the command will appear at if it's ever committed.
+	2.current term.
+	3. true if this server believes it is the leader.
+*/
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
 
 	// Your code here (2B).
-
-
 	return index, term, isLeader
 }
 
-//
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -230,7 +297,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // up CPU time, perhaps causing later tests to fail and generating
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
-//
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -241,29 +307,29 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
+// The ticker go routine starts a new election if this peer hasn't received heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
+		// Your code here to
+		// check if a leader election should be started
+		// to randomize sleeping time using time.Sleep().
 
 	}
 }
 
-//
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-//
+/*
+	Make
+
+the service or tester wants to create a Raft server
+the ports of all the Raft servers (including this one) are in peers[]
+this server's port is peers[me]
+all the servers' peers[] arrays have the same order
+persister is a place for this server to save its persistent state, and also initially holds the most recent saved state
+if any. applyCh is a channel on which the tester or service expects Raft to send ApplyMsg messages.
+
+	Make() must return quickly, so it should start goroutines for any long-running work.
+*/
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -277,8 +343,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	// kick off leader election periodically by sending out RequestVote RPCs when it hasn't heard from another peer for a while.
 	go rf.ticker()
-
 
 	return rf
 }
