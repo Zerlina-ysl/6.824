@@ -3,87 +3,111 @@ package mr
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/sirupsen/logrus"
 	"io/ioutil"
 	"os"
-	"sort"
-	"strconv"
-	"time"
+	"path/filepath"
 )
 import "log"
 import "net/rpc"
 import "hash/fnv"
 
-const (
-	MAP_FILE_PREFIX    = "mr-map-"
-	REDUCE_FILE_PREFIX = "mr-out-"
+//
+// Map functions return a slice of KeyValue.
+//
+
+var (
+	MapTaskFinish    = 0
+	ReduceTaskFinish = 0
 )
 
-// Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
+
 type ByKey []KeyValue
 
+// for sorting by key.
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
+//
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
+//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+//
 // main/mrworker.go calls this function.
-func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+//
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+	// 获取任务
+	task := AskTask()
 
-	//  send an RPC to the coordinator asking for a task
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
-	askFlag := true
-	for askFlag {
-		task := CallAssignTask()
-		fmt.Printf("[INFO]get task from coornator,taskID=%d,taskType=%v,len(task.file)=%d\n", task.TaskID, task.TaskType, len(task.Input))
-		switch task.TaskType {
-
-		case MapTask:
-			fmt.Println("-------------map----------------")
-			DoMapTask(mapf, &task)
-			MarkDone(&task)
-
-		case ReduceTask:
-			fmt.Println("-------------reduce----------------")
-			DoReduceTask(reducef, &task)
-			MarkDone(&task)
-
-		case WaitingType:
-			fmt.Println("-----------waitingType,sleep----------------")
-			time.Sleep(200 * time.Millisecond)
-
-		case ExitType:
-			time.Sleep(200 * time.Millisecond)
-			askFlag = false
-			fmt.Println("-----------all task done------------------")
-		}
-
+	// 判断任务类型并执行
+	switch task.taskType {
+	case MapTask:
+		logrus.Info("---DoMapTask---", task.ID)
+		DoMapTask(task, mapf)
+		MarkTaskFinish(task)
+	case ReduceTask:
+		logrus.Info("---DoReduceTask---", task.ID)
+		DoReduceTask(task, reducef)
+		MarkTaskFinish(task)
+	default:
+		print()
 	}
-
-	time.Sleep(time.Second * 1)
-
 }
 
-func DoReduceTask(reducef func(string, []string) string, t *Task) {
-	// 对reduce任务要处理的中间键排序
-	fmt.Printf("Coordinator:[INFO] do reduce task,len(file)=%d", len(t.Input))
-	intermediate := sortKV(t.Input)
-	// 创建临时文件
-	dir, _ := os.Getwd()
-	tmpFile, _ := ioutil.TempFile(dir, "mr-temp-*")
+func MarkTaskFinish(task *Task) {
+
+	ok := call("Coordinator.FinishTask", task, nil)
+	if ok {
+		// reply.Y should be 100.
+		logrus.Info("call MarkTaskFinish %v", task.ID)
+	} else {
+		logrus.Warn("call MarkTaskFinish failed!")
+	}
+}
+
+func DoReduceTask(task *Task, reducef func(string, []string) string) {
+	intermediate := []KeyValue{}
+	reduceFileName := fmt.Sprintf("mr-*-%d", task.ID)
+	// 遍历当前目录下所有命名匹配reduceFileName的文件名
+	// 以reduce任务为粒度，合并统计
+	matchFiles, _ := filepath.Glob(reduceFileName)
+	for _, matchFile := range matchFiles {
+		file, err := os.Open(matchFile)
+		if err != nil {
+			log.Fatalf("cannot open %v", file)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", file)
+		}
+		file.Close()
+		var kva []KeyValue
+		err = json.Unmarshal(content, &kva)
+		if err != nil {
+			logrus.Error("unmarshal error", kva)
+			continue
+		}
+		intermediate = append(intermediate, kva...)
+	}
+	oname := fmt.Sprintf("mr-out-%d", task.ID)
+	ofile, _ := os.Create(oname)
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -97,79 +121,60 @@ func DoReduceTask(reducef func(string, []string) string, t *Task) {
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(tmpFile, "%v %v\n", intermediate[i].Key, output)
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
 
 		i = j
 	}
-	tmpFile.Close()
-	// 写入成功后对临时文件重命名
-	fn := REDUCE_FILE_PREFIX + strconv.Itoa(t.TaskID)
-	os.Rename(tmpFile.Name(), fn)
+
+	ofile.Close()
+
 }
 
-func sortKV(input []string) []KeyValue {
-	var kva []KeyValue
-	for _, filename := range input {
-		file, _ := os.Open(filename)
-		dec := json.NewDecoder(file)
-		for {
-			var kv KeyValue
-			if err := dec.Decode(&kv); err != nil {
-				break
-			}
-			kva = append(kva, kv)
+func DoMapTask(task *Task, mapf func(string, string) []KeyValue) {
+
+	for _, filename := range os.Args[2:] {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
 		}
 		file.Close()
-	}
-	sort.Sort(ByKey(kva))
-	return kva
-}
-
-func DoMapTask(mapf func(string, string) []KeyValue, t *Task) {
-	// 处理map任务
-	intermediate := []KeyValue{}
-	filename := t.Input[0]
-	file, err := os.Open(filename)
-	if err != nil {
-		log.Fatalf("[FATAL] cannot open %v", filename)
-	}
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Fatalf("[FATAL]  cannot read %v", filename)
-	}
-	file.Close()
-	kva := mapf(filename, string(content))
-	intermediate = append(intermediate, kva...)
-
-	// 在这里排序没有意义，因为根据key重新写入文件中
-	//sort.Sort(ByKey(intermediate))
-
-	// 将map输出写入文件 并指定运行的reduce任务
-	rn := t.ReduceNum
-	HashedKV := make([][]KeyValue, rn)
-	for _, kv := range intermediate {
-		// 根据key值进行hash分配
-		HashedKV[ihash(kv.Key)%rn] = append(HashedKV[ihash(kv.Key)%rn], kv)
-	}
-	for i := 0; i < rn; i++ {
-		// 需要创建中间文件备份map输出，防止crash后所有数据丢失
-		// mr-map-任务id-处理kv的reduce任务id
-		oname := MAP_FILE_PREFIX + strconv.Itoa(t.TaskID) + "-" + strconv.Itoa(i)
-		ofile, _ := os.Create(oname)
-		enc := json.NewEncoder(ofile)
-		for _, kv := range HashedKV[i] {
-			err := enc.Encode(&kv)
+		kva := mapf(filename, string(content))
+		for _, key := range kva {
+			tmpFileName := fmt.Sprintf("mr-%d-%d", task.ID, ihash(key.Key)%task.reduceNum)
+			ofile, _ := os.Create(tmpFileName)
+			defer ofile.Close()
+			enc := json.NewEncoder(ofile)
+			err := enc.Encode(&kva)
 			if err != nil {
-				log.Fatalf("[FATAL]  intermediate Encode error,encode kv %v", kv)
+				logrus.Errorf("encode error,err:%v,task.Id:%v,kv:%v", err, task.ID, kva)
+				continue
 			}
 		}
-		ofile.Close()
+
 	}
 }
 
+func AskTask() *Task {
+	task := Task{}
+	ok := call("Coordinator.AssignTask", nil, &task)
+	if ok {
+		// reply.Y should be 100.
+		fmt.Printf("reply.Y %v\n", task.ID)
+	} else {
+		fmt.Printf("call AssignTask failed!\n")
+	}
+	return &task
+}
+
+//
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
+//
 func CallExample() {
 
 	// declare an argument structure.
@@ -194,35 +199,11 @@ func CallExample() {
 	}
 }
 
-func CallAssignTask() Task {
-	args := TaskArgs{}
-	reply := Task{}
-	ok := call("Coordinator.AssignTask", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("[INFO] Coordinator.AssignTask task.id=%v,len(input)=%d\n", reply.TaskID, len(reply.Input))
-	} else {
-		fmt.Printf("[ERROR] Coordinator.AssignTask call failed!\n")
-	}
-	return reply
-}
-
-func MarkDone(t *Task) Task {
-	args := t
-	reply := Task{}
-	ok := call("Coordinator.MarkFinished", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("Worker:[INFO] Coordinator.MarkFinished task.id=%v\n", t.TaskID)
-	} else {
-		fmt.Printf("Worker:[ERROR] Coordinator.MarkFinished call failed!\n")
-	}
-	return reply
-}
-
+//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
+//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
