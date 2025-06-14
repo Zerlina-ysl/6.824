@@ -18,9 +18,12 @@ package raft
 //
 
 import (
+	"math/rand"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
+
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -31,6 +34,10 @@ const (
 	Follower RfType = iota
 	Candidater
 	Leader
+)
+
+var (
+	elecRand = rand.New(rand.NewSource(time.Now().Unix())) //创建随机数种子，种子值是当前时间的Unix时间戳
 )
 
 /*
@@ -69,19 +76,24 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	rfType RfType
 
 	// status for leader election
+	// 需要持久化的内容
 	currentTerm int // 当前任期
 	votedFor    int // 当前任期所投票的candidateID
 	logEntry    []LogEntry
 
-	rfType RfType
-
+	// 所有server都具有的属性
 	commitIndex      int // logEntry中已被提交的命令行下标
 	lastAppliedIndex int // 上一个被提交的logEntry下标
+	// 只有leader具有的属性
+	nextIndex  []LogEntry // 要发送到follower服务器的下一个logEntry的索引
+	matchIndex []LogEntry //在follower服务器复制的最高logEntry的索引
 
-	nextIndex  []LogEntry
-	matchIndex []LogEntry
+	lastActiveTime time.Time // 最近一次收到AppendEntries的时间
+
+	timer *time.Time
 }
 
 // 日志条目
@@ -152,8 +164,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+
+//
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
+//
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	term         int // candidate的任期
@@ -162,17 +177,29 @@ type RequestVoteArgs struct {
 	lastLogTerm  int // candidate最新一条日志条目被提交时的任期
 }
 
+//
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
+//
 type RequestVoteReply struct {
 	// Your data here (2A).
 	term        int  // 当前任期，candidate需要将该值更新为任期值
 	voteGranted bool // 接受者是否给自己投票
+	error status
 }
 
+//
 // example RequestVote RPC handler.
+//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args.term>rf.currentTerm {
+		reply.voteGranted = false
+		reply.error = TermError
+		return
+	}
+	if rf.votedFor==0{
+
 }
 
 type AppendEntriesArgs struct {
@@ -194,45 +221,44 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
 	// Your code here (2A, 2B).
-	// 只有leader可以发
-	if rf.rfType != Leader {
-		return
-	}
+	reply.success = false
 	if rf.currentTerm > args.term {
 		// reply false is term<currentTerm
-		reply.success = false
 		// for leader to update itself
 		reply.term = rf.currentTerm
-		reply.err = AppendEntriesTermError
+		reply.err = TermError
+		PrettyDebug(dError, "AppendEntries args.term<currentTerm,args.Term:%v,currentTerm:%v", args.term, rf.currentTerm)
 		return
 	}
 	reply.term = args.term
 
 	if args.prevLogIndex == rf.getLastLogIndex() && args.prevLogTerm != args.entries[rf.getLastLogIndex()].term {
-		reply.success, reply.err = false, AppendEntriesLastLogError
+		PrettyDebug(dError, "when prevLogTerm match,prevLogIndex doesnt match,args.term:%v,args.index:%v,rf.term:%v,rf.index:%v",
+			args.term, args.prevLogTerm, rf.currentTerm, rf.getLastLogIndex())
+		reply.err = AppendEntriesLastLogIndexError
 		return
 	}
-	rf.CorrectConflictIndex(args.entries)
+	rf.lastActiveTime = time.Now()
+	if args.prevLogIndex < rf.getLastLogIndex() {
+		// 新日志entry的索引不大于follower日志的索引 出现冲突
+		rf.logEntry = rf.logEntry[:args.prevLogIndex+1]
+	}
+	// 追加日志
+	rf.logEntry = append(rf.logEntry, args.entries...)
 
-}
-func (rf *Raft) getLastLogIndex() int {
-	return len(rf.logEntry) - 1
-}
-
-// CorrectConflictIndex 修正logEntrysame index but different terms)
-func (rf *Raft) CorrectConflictIndex(entries []LogEntry) bool {
-	for _, entry := range entries {
-		for idx, rfEntry := range rf.logEntry {
-			if entry.logIndex == rfEntry.logTerm && entry.logIndex != rfEntry.logIndex {
-				// delete the existing entry and all that follow it
-				rf.logEntry[idx].logIndex = entry.logIndex
-			}
-			if entry.logIndex > rf.logEntry[idx].logIndex {
-
-			}
+	if args.leaderCommit > rf.commitIndex {
+		rf.commitIndex = rf.getLastLogIndex()
+		if args.leaderCommit < rf.getLastLogIndex() {
+			rf.commitIndex = args.leaderCommit
 		}
 	}
-	return true
+	reply.success = true
+	PrettyDebug(dInfo, "AppendEntries success")
+
+}
+
+func (rf *Raft) getLastLogIndex() int {
+	return len(rf.logEntry) - 1
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -263,6 +289,7 @@ func (rf *Raft) CorrectConflictIndex(entries []LogEntry) bool {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
+//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
@@ -310,13 +337,26 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// The ticker go routine starts a new election if this peer hasn't received heartsbeats recently.
+//  ticker go routine starts a new election if this peer hasn't received heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
 		// Your code here to
 		// check if a leader election should be started
 		// to randomize sleeping time using time.Sleep().
+		time.Sleep(time.Second * 1)
+		if rf.rfType == Leader {
+			return
+		}
+
+		if rf.lastActiveTime.Sub(time.Now()) < randomElectionTimeout {
+			return
+		}
+
+		PrettyDebug(dTimer, "heartbeat timeout,start new election")
+		// 发起选举
+
 
 	}
 }
@@ -346,8 +386,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	// kick off leader election periodically by sending out RequestVote RPCs when it hasn't heard from another peer for a while.
 	go rf.ticker()
+
 
 	return rf
 }

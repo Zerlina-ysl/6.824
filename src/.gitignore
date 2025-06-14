@@ -11,4 +11,4 @@ mrtmp.*
 /main/mrsequential
 /main/mrworker
 ../../.DS_Store
-/.idea/
+../.idea/

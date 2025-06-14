@@ -1,25 +1,26 @@
 package mr
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
+	"github.com/rifflock/lfshook"
 	"github.com/sirupsen/logrus"
+	prefixed "github.com/x-cray/logrus-prefixed-formatter"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
+	"time"
 )
 import "log"
 import "net/rpc"
 import "hash/fnv"
 
-//
-// Map functions return a slice of KeyValue.
-//
-
-var (
-	MapTaskFinish    = 0
-	ReduceTaskFinish = 0
-)
+var fileFormatter *prefixed.TextFormatter // 文件输出格式
 
 type KeyValue struct {
 	Key   string
@@ -48,60 +49,115 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	// 获取任务
-	task := AskTask()
 
-	// 判断任务类型并执行
-	switch task.taskType {
-	case MapTask:
-		logrus.Info("---DoMapTask---", task.ID)
-		DoMapTask(task, mapf)
-		MarkTaskFinish(task)
-	case ReduceTask:
-		logrus.Info("---DoReduceTask---", task.ID)
-		DoReduceTask(task, reducef)
-		MarkTaskFinish(task)
-	default:
-		print()
+	initLog()
+
+	for {
+		// 获取任务
+		task := AskTask()
+		logrus.Infof("ask task ,task.ID:%v,task.Type:%v,task.file:%v,reduceNum:%v",
+			task.ID, task.TaskType, task.File, task.ReduceNum)
+		// 判断任务类型并执行
+		switch task.TaskType {
+		case MapTask:
+			logrus.Info("---DoMapTask---", task.ID)
+			DoMapTask(task, mapf)
+			MarkTaskFinish(task)
+		case ReduceTask:
+			logrus.Info("---DoReduceTask---", task.ID)
+			DoReduceTask(task, reducef)
+			MarkTaskFinish(task)
+		case ExitTask:
+			logrus.Info("---ExitTask---")
+			return
+		}
+		time.Sleep(500 * time.Microsecond)
 	}
+}
+
+func initLog() {
+	logPath, _ := os.Getwd()
+	// 按照pid输出
+	logName := fmt.Sprintf("%s/worker.%d.%s.", logPath, os.Getpid(), time.Now().Format("20060102-150405"))
+	r, _ := rotatelogs.New(logName + "%Y%m%d")
+	mw := io.MultiWriter(r)
+	logrus.SetOutput(mw)
+	writer, _ := rotatelogs.New(logName + "%Y%m%d")
+
+	fileFormatter = &prefixed.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02.15:04:05.000000",
+		ForceFormatting: true,
+		ForceColors:     true,
+		DisableColors:   true,
+	}
+
+	logrus.SetFormatter(fileFormatter)
+	logrus.SetLevel(logrus.DebugLevel)
+	lfHook := lfshook.NewHook(lfshook.WriterMap{
+		logrus.InfoLevel:  writer,
+		logrus.DebugLevel: writer,
+		logrus.ErrorLevel: writer,
+		logrus.FatalLevel: writer,
+	}, fileFormatter)
+
+	logrus.AddHook(lfHook)
+	logrus.Info("init log ....")
 }
 
 func MarkTaskFinish(task *Task) {
 
-	ok := call("Coordinator.FinishTask", task, nil)
+	ok := call("Coordinator.FinishTask", &task, &task)
 	if ok {
 		// reply.Y should be 100.
-		logrus.Info("call MarkTaskFinish %v", task.ID)
+		logrus.Info("call FinishTask ", task.ID)
 	} else {
-		logrus.Warn("call MarkTaskFinish failed!")
+		logrus.Warn("call FinishTask failed!")
 	}
 }
 
 func DoReduceTask(task *Task, reducef func(string, []string) string) {
 	intermediate := []KeyValue{}
-	reduceFileName := fmt.Sprintf("mr-*-%d", task.ID)
+	reduceFileName := fmt.Sprintf("mr-*-%d", task.ID%task.ReduceNum)
 	// 遍历当前目录下所有命名匹配reduceFileName的文件名
 	// 以reduce任务为粒度，合并统计
 	matchFiles, _ := filepath.Glob(reduceFileName)
 	for _, matchFile := range matchFiles {
+
 		file, err := os.Open(matchFile)
 		if err != nil {
-			log.Fatalf("cannot open %v", file)
+			logrus.Fatalf("cannot open %v,err:%v", file, err)
+			continue
 		}
 		content, err := ioutil.ReadAll(file)
 		if err != nil {
-			log.Fatalf("cannot read %v", file)
+			logrus.Fatalf("cannot read %v,err:%v", file, err)
+			continue
 		}
 		file.Close()
+		reader := bytes.NewBuffer(content)
+		scanner := bufio.NewScanner(reader)
 		var kva []KeyValue
-		err = json.Unmarshal(content, &kva)
-		if err != nil {
-			logrus.Error("unmarshal error", kva)
+		for scanner.Scan() {
+			line := scanner.Text()
+			var kv []KeyValue
+			if err = json.Unmarshal([]byte(line), &kv); err == nil {
+				kva = append(kva, kv...)
+			} else {
+				logrus.Errorf("json.Unmarshal error: %v", err)
+				continue
+			}
+		}
+
+		if err = scanner.Err(); err != nil {
+			logrus.Errorf("scanner error: %v", err)
 			continue
 		}
 		intermediate = append(intermediate, kva...)
 	}
-	oname := fmt.Sprintf("mr-out-%d", task.ID)
+	sort.Sort(ByKey(intermediate))
+
+	oname := fmt.Sprintf("mr-out-%d", task.ID%task.ReduceNum)
 	ofile, _ := os.Create(oname)
 
 	//
@@ -125,49 +181,57 @@ func DoReduceTask(task *Task, reducef func(string, []string) string) {
 
 		i = j
 	}
-
 	ofile.Close()
-
 }
 
 func DoMapTask(task *Task, mapf func(string, string) []KeyValue) {
-
-	for _, filename := range os.Args[2:] {
-		file, err := os.Open(filename)
+	filename := task.File
+	file, err := os.Open(filename)
+	if err != nil {
+		logrus.Fatalf("cannot open %v,err:%v", filename, err)
+		return
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		logrus.Fatalf("cannot read %v,err:%v", filename, err)
+		return
+	}
+	file.Close()
+	kva := mapf(filename, string(content))
+	for _, key := range kva {
+		tmpFileName := fmt.Sprintf("mr-%d-%d", task.ID, ihash(key.Key)%task.ReduceNum)
+		var ofile *os.File
+		if _, err = os.Stat(tmpFileName); err == nil {
+			// 文件一存在
+			ofile, err = os.OpenFile(tmpFileName, os.O_APPEND|os.O_WRONLY, 0666)
+		} else {
+			ofile, err = os.Create(tmpFileName)
+		}
 		if err != nil {
-			log.Fatalf("cannot open %v", filename)
+			logrus.Errorf("create error,err:%v,tmpFileName:%v", err, tmpFileName)
+			continue
 		}
-		content, err := ioutil.ReadAll(file)
+		enc := json.NewEncoder(ofile)
+		err = enc.Encode([]KeyValue{key})
 		if err != nil {
-			log.Fatalf("cannot read %v", filename)
+			logrus.Errorf("encode error,err:%v,task.Id:%v,kv:%v", err, task.ID, kva)
+			ofile.Close()
+			continue
 		}
-		file.Close()
-		kva := mapf(filename, string(content))
-		for _, key := range kva {
-			tmpFileName := fmt.Sprintf("mr-%d-%d", task.ID, ihash(key.Key)%task.reduceNum)
-			ofile, _ := os.Create(tmpFileName)
-			defer ofile.Close()
-			enc := json.NewEncoder(ofile)
-			err := enc.Encode(&kva)
-			if err != nil {
-				logrus.Errorf("encode error,err:%v,task.Id:%v,kv:%v", err, task.ID, kva)
-				continue
-			}
-		}
+		ofile.Close()
 
 	}
 }
 
 func AskTask() *Task {
-	task := Task{}
-	ok := call("Coordinator.AssignTask", nil, &task)
+	task := &Task{}
+	ok := call("Coordinator.AssignTask", task, task)
 	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", task.ID)
+		logrus.Infof("call Coordinator.AssignTask  task.ID:%v,file:%v", task.ID, task.File)
 	} else {
-		fmt.Printf("call AssignTask failed!\n")
+		logrus.Info("call AssignTask failed!")
 	}
-	return &task
+	return task
 }
 
 //
