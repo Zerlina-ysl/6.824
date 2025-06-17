@@ -1,170 +1,91 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"strconv"
-	"strings"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
 	"sync"
 	"time"
+
+	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
+	"github.com/rifflock/lfshook"
+	"github.com/sirupsen/logrus"
+	prefixed "github.com/x-cray/logrus-prefixed-formatter"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+
+var TaskID int
+
+type TashPhase int
+
+const (
+	Map TashPhase = iota + 1
+	Reduce
+	Done
+)
+
+type TaskStatus int
+
+const (
+	Prepare TaskStatus = iota + 1
+	Running
+	Finish
+)
+
+type TaskType int
+
+const (
+	MapTask TaskType = iota + 1
+	ReduceTask
+	ExitTask
+)
+
+type Task struct {
+	ID        int
+	File      string
+	StartTime time.Time
+	Status    TaskStatus
+	TaskType  TaskType
+	ReduceNum int
+}
 
 var (
-	lock sync.Mutex // 全局锁
+	calNumLock    sync.RWMutex
+	TIME_OUT      = 10 * time.Second
+	taskIdLock    sync.Mutex
+	taskInfoLock  sync.RWMutex
+	taskFinishMap = make(map[int]bool)
 )
 
-// TaskMetaInfo 所有任务在coordinator维护状态
-type TaskMetaInfo struct {
-	status    Status    // 任务状态
-	StartTime time.Time // 任务的开始时间
-	TaskAdr   *Task     // 任务
-}
-
-type TaskMetaHolder struct {
-	MetaMap map[int]*TaskMetaInfo // taskId--> Task
-}
-
-func (holder TaskMetaHolder) changeStatus(taskID int) bool {
-	taskInfo, has := holder.MetaMap[taskID]
-	if !has || taskInfo.status != Waiting {
-		return false
-	}
-	taskInfo.status = Running
-	taskInfo.StartTime = time.Now()
-	return true
-}
-
-func (holder TaskMetaHolder) isTaskDone() bool {
-	var (
-		mapUndoneNum    int = 0
-		mapDoneNum      int = 0
-		reduceUndoneNum     = 0
-		reduceDoneNum       = 0
-	)
-	for _, t := range holder.MetaMap {
-		if t.TaskAdr.TaskType == MapTask {
-			if t.status == Done {
-				mapDoneNum++
-			} else {
-				mapUndoneNum++
-			}
-		} else if t.TaskAdr.TaskType == ReduceTask {
-			if t.status == Done {
-				reduceDoneNum++
-			} else {
-				reduceUndoneNum++
-			}
-		}
-	}
-	fmt.Printf("Coordinator:[INFO]check task is done,mapRunning=%d,mapDone=%d,reduceRunning=%d,reduceDone=%d\n", mapUndoneNum, mapDoneNum, reduceUndoneNum, reduceDoneNum)
-
-	if mapUndoneNum == 0 && mapDoneNum > 0 && reduceUndoneNum == 0 && reduceDoneNum == 0 {
-		// map阶段运行完毕
-		return true
-	} else if reduceDoneNum > 0 && reduceUndoneNum == 0 {
-		// reduce阶段运行完毕
-		return true
-	}
-	return false
-}
-
-// acceptMeta 接受Task元信息并存储
-func (holder TaskMetaHolder) acceptMeta(t *TaskMetaInfo) {
-	holder.MetaMap[t.TaskAdr.TaskID] = t
-}
-
 type Coordinator struct {
-	Status         Status `json:"status"` // 整个mapreduce任务的状态，任务完成后，所有工作线程也可以退出
-	MapChannel     chan *Task
-	ReduceChannel  chan *Task
-	Phase          TaskPhase
-	TaskMetaHolder TaskMetaHolder // 根据taskID存储task的元数据
-	ReduceNum      int            // reduce任务数量
-	TaskID         int            // 用于生成自增id
-	// TODO 在reduce阶段应该存在汇总过程
-	files []string // map接收到输入文件数组后，会将map运行的中间值写入对应文件中
+	ReduceNum      int
+	files          []string
+	phase          TashPhase
+	taskInfo       map[int]*Task
+	mapTaskChan    chan *Task
+	reduceTaskChan chan *Task
+	doneTaskChan   chan *Task
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
+//
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
+//
 func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
 	return nil
 }
 
-func (c *Coordinator) AssignTask(args *TaskArgs, reply *Task) error {
-	// 整个过程加锁保证线程安全
-	lock.Lock()
-	defer lock.Unlock()
-	fmt.Printf("Coordinator:[INFO]worker call coordinator for task,current phase is %v\n", c.Phase)
-
-	switch c.Phase {
-	case MapPhase:
-		if len(c.MapChannel) > 0 {
-			// 从通道中取出的任务对象内容会被复制到 reply 所指向的对象中
-			*reply = *<-c.MapChannel
-			fmt.Printf("Coordinator:[DEBUG]AssignTask task from chan,current phase is map,taskID=%d,len(input)=%d\n", reply.TaskID, len(reply.Input))
-			c.TaskMetaHolder.changeStatus(reply.TaskID)
-			//	fmt.Printf("[WARN] map-taskID[%d] is running", reply.TaskID)
-			//}
-		} else {
-			// map任务分发完毕，等待任务执行
-			reply.TaskType = WaitingType
-			if c.TaskMetaHolder.isTaskDone() {
-				c.toNextPhase()
-			}
-			return nil
-		}
-	case ReducePhase:
-		if len(c.ReduceChannel) > 0 {
-			*reply = *<-c.ReduceChannel
-			fmt.Printf("Coordinator:[DEBUG]AssignTask task from chan,current phase is reduce,taskID=%d,len(input)=%d\n", reply.TaskID, len(reply.Input))
-			c.TaskMetaHolder.changeStatus(reply.TaskID)
-			//	fmt.Printf("[WARN] reduce-taskID[%d] is running", reply.TaskID)
-			//}
-		} else {
-			reply.TaskType = WaitingType
-			if c.TaskMetaHolder.isTaskDone() {
-				c.toNextPhase()
-			}
-			return nil
-		}
-	case AllDone:
-		reply.TaskType = ExitType
-	default:
-		panic("error phase")
-	}
-
-	return nil
-}
-
-func (c *Coordinator) MarkFinished(args *Task, reply *Task) error {
-	fmt.Printf("Coordinator:[INFO]worker call coordinator for Mark finish,current taskType is %v,taskid=%d\n", args.TaskType, args.TaskID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	if args.TaskType == MapTask || args.TaskType == ReduceTask {
-		meta, ok := c.TaskMetaHolder.MetaMap[args.TaskID]
-		if ok && meta.status == Running {
-			meta.status = Done
-		} else {
-			fmt.Printf("Coordinator:[WARN]Map task Id[%d] is finished,already ! ! !\n", args.TaskID)
-		}
-	} else {
-		panic("MarkFinished error,unknown taskType")
-	}
-
-	return nil
-}
-
+//
 // start a thread that listens for RPCs from worker.go
+//
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -172,145 +93,230 @@ func (c *Coordinator) server() {
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
-	fmt.Printf("Coordinator:[INFO]coordinator server alreay start...\n")
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
 }
 
+//
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
-// mrcoordinator.go will exit
+//
 func (c *Coordinator) Done() bool {
-	//ret := false
-	lock.Lock()
-	defer lock.Unlock()
-	if c.Phase == AllDone {
-		return true
-	}
-	return false
+	return c.phase == Done
 }
 
-// toNextPhase mapreduce的阶段切换
-func (c *Coordinator) toNextPhase() {
-	fmt.Printf("Coordinator:[INFO]change to next phase,current phase is %v\n", c.Phase)
-	if c.Phase == MapPhase {
-		c.makeReduceTasks()
-		c.Phase = ReducePhase
-	} else if c.Phase == ReducePhase {
-		c.Phase = AllDone
-	}
-}
-
-func (c *Coordinator) generateTaskID() int {
-	// 采取自增实现
-	id := c.TaskID
-	c.TaskID++
-	return id
-}
-
-// makeMapTasks 将对应的任务推入channel,并存储taskid到task的映射
-func (c *Coordinator) makeMapTasks(files []string) {
-	for _, value := range files {
-		task := Task{
+func (c *Coordinator) genTaskInfo() {
+	taskList := make([]*Task, 0, len(c.files))
+	for _, file := range c.files {
+		task := &Task{
+			File:      file,
+			Status:    Prepare,
+			ID:        TaskID,
 			TaskType:  MapTask,
-			TaskID:    c.generateTaskID(),
-			Input:     []string{value},
 			ReduceNum: c.ReduceNum,
 		}
-		taskMetaInfo := TaskMetaInfo{
-			status:  Waiting,
-			TaskAdr: &task,
-		}
-		c.TaskMetaHolder.acceptMeta(&taskMetaInfo)
-		c.MapChannel <- &task
+		taskList = append(taskList, task)
+
+		genTaskId()
+		c.mapTaskChan <- task
 	}
-	fmt.Printf("Coordinator:[INFO]push map task to channel,len(chan)=%d\n", len(c.MapChannel))
+	c.setTask(taskList)
 }
 
-func (c *Coordinator) makeReduceTasks() {
-	for i := 0; i < c.ReduceNum; i++ {
-		id := c.generateTaskID()
-		task := Task{
-			TaskType: ReduceTask,
-			TaskID:   id,
-			Input:    selectReduceFile(i),
-		}
-		taskMetaInfo := TaskMetaInfo{
-			status:  Waiting,
-			TaskAdr: &task,
-		}
-		c.TaskMetaHolder.acceptMeta(&taskMetaInfo)
-		c.ReduceChannel <- &task
+func (c *Coordinator) AssignTask(req *Task, reply *Task) error {
+	var taskChan chan *Task
+	if c.phase == Map {
+		taskChan = c.mapTaskChan
+	} else if c.phase == Reduce {
+		taskChan = c.reduceTaskChan
+	} else if c.phase == Done {
+		taskChan = c.doneTaskChan
+	}
+	select {
+	case task := <-taskChan:
+		task.StartTime = time.Now()
+		task.Status = Running
+		c.setTask([]*Task{task})
+		*reply = *task
+		logrus.Info("assign task ,task:", task)
+	default:
+		time.Sleep(100 * time.Microsecond)
+	}
+	return nil
+}
+
+func (c *Coordinator) setTask(tasks []*Task) {
+	taskInfoLock.Lock()
+	defer taskInfoLock.Unlock()
+	for _, task := range tasks {
+		c.taskInfo[task.ID] = task
 	}
 }
 
-func (c *Coordinator) CrashDetector() {
-	for {
-		time.Sleep(time.Second * 2)
-		lock.Lock()
-		if c.Phase == AllDone {
-			lock.Unlock()
-			break
-		}
-		for _, task := range c.TaskMetaHolder.MetaMap {
-			// 超时检测
-			if task.status == Running && time.Since(task.StartTime) > 9*time.Second {
-				fmt.Printf("Coordinator:[WARN]the task is crash,taskid=%d,taskType=%d\n", task.TaskAdr.TaskID, task.TaskAdr.TaskType)
+func (c *Coordinator) FinishTask(req *Task, reply *Task) error {
+	if req.Status != Running {
+		return fmt.Errorf("task %v status is not Running", req.ID)
+	}
+	// 维护task状态
+	req.Status = Finish
+	c.setTask([]*Task{req})
+	logrus.Infof("finish task ,task.ID:%v,StartTime:%v,currentPhase:%v,taskType:%v", req.ID, req.StartTime, c.phase, req.TaskType)
 
-				if task.TaskAdr.TaskType == MapTask {
-					c.MapChannel <- task.TaskAdr
-					task.status = Waiting
+	calNumLock.Lock()
+	taskFinishMap[req.ID] = true
+	calNumLock.Unlock()
 
-				}
-				if task.TaskAdr.TaskType == ReduceTask {
-					c.ReduceChannel <- task.TaskAdr
-					task.status = Waiting
-				}
+	calNumLock.RLock()
+	defer calNumLock.RUnlock()
+
+	logrus.Infof("markFinish---,taskId:%v,finish:%v,currentPhase:%d",
+		req.ID, marshal(taskFinishMap), c.phase)
+	if c.phase == Map {
+		for i := 0; i < len(c.files); i++ {
+			if !taskFinishMap[i] {
+				return nil
 			}
 		}
-		lock.Unlock()
+		c.toNextPhase()
+	} else if c.phase == Reduce {
+		for i := len(c.files); i < len(c.files)+c.ReduceNum; i++ {
+			if !taskFinishMap[i] {
+				return nil
+			}
+		}
+		c.toNextPhase()
 	}
+	return nil
 }
 
-func selectReduceFile(reduceNum int) []string {
-	// 读取当前目录下所有文件
-	reduceFiles := []string{}
-	path, _ := os.Getwd()
-	files, _ := os.ReadDir(path)
-	for _, file := range files {
-		// 根据文件名称匹配
-		if strings.HasPrefix(file.Name(), MAP_FILE_PREFIX) &&
-			strings.HasSuffix(file.Name(), strconv.Itoa(reduceNum)) {
-			reduceFiles = append(reduceFiles, file.Name())
+func (c *Coordinator) toNextPhase() {
+	if c.phase == Map {
+		c.phase = Reduce
+		taskList := make([]*Task, 0, c.ReduceNum)
+		for i := 0; i < c.ReduceNum; i++ {
+			task := &Task{
+				TaskType:  ReduceTask,
+				ReduceNum: c.ReduceNum,
+				ID:        TaskID,
+				Status:    Prepare,
+			}
+			genTaskId()
+			taskList = append(taskList, task)
+			c.reduceTaskChan <- task
+		}
+
+		c.setTask(taskList)
+	} else if c.phase == Reduce {
+		c.phase = Done
+		c.doneTaskChan <- &Task{
+			TaskType: ExitTask,
+			ID:       TaskID,
 		}
 	}
-	return reduceFiles
+	logrus.Infof("toNextPhase,phase:%v,finish:%v", c.phase, marshal(taskFinishMap))
 }
 
+func (c *Coordinator) crashDetect() {
+	for c.phase != Done {
+		time.Sleep(3 * time.Second)
+		overTimeTask := []*Task{}
+		taskInfoLock.RLock()
+		// 获取超时任务
+		for taskId := range c.taskInfo {
+			taskInfo := c.taskInfo[taskId]
+			//logrus.Debugf("taskId:%v,runningTime:%v", taskId, time.Now().Sub(taskInfo.StartTime))
+			if taskInfo.Status == Running && time.Now().Sub(taskInfo.StartTime) > TIME_OUT {
+				logrus.Infof("detect crash task,taskId:%v,holdTime:%v", taskId, time.Now().Sub(taskInfo.StartTime))
+				overTimeTask = append(overTimeTask, taskInfo)
+			}
+		}
+		taskInfoLock.RUnlock()
+
+		// 维护任务状态
+		for _, taskInfo := range overTimeTask {
+			taskInfo.Status = Prepare
+		}
+		c.setTask(overTimeTask)
+
+		// 重新推入chan
+		for _, taskInfo := range overTimeTask {
+			if taskInfo.TaskType == MapTask {
+				if c.phase == Reduce {
+					logrus.Errorf("error phase,error crash task,taskId:%v,phase:%v,task.Type:%v", taskInfo.ID, c.phase, taskInfo.TaskType)
+					continue
+				}
+				c.mapTaskChan <- taskInfo
+			} else if taskInfo.TaskType == ReduceTask {
+				if c.phase == Map {
+					logrus.Errorf("error phase,error crash task,taskId:%v,phase:%v,task.Type:%v", taskInfo.ID, c.phase, taskInfo.TaskType)
+					continue
+				}
+				c.reduceTaskChan <- taskInfo
+			}
+		}
+
+	}
+}
+
+//
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
+//
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		ReduceNum:     nReduce,
-		files:         files,
-		TaskID:        0,
-		Phase:         MapPhase,
-		MapChannel:    make(chan *Task, len(files)),
-		ReduceChannel: make(chan *Task, nReduce),
-		TaskMetaHolder: TaskMetaHolder{
-			MetaMap: make(map[int]*TaskMetaInfo, len(files)+nReduce),
-		},
+		ReduceNum:      nReduce,
+		files:          files,
+		phase:          Map,
+		mapTaskChan:    make(chan *Task, len(files)),
+		reduceTaskChan: make(chan *Task, nReduce),
+		doneTaskChan:   make(chan *Task, 1),
+		taskInfo:       make(map[int]*Task, len(files)+nReduce),
 	}
-	fmt.Printf("Coordinator:[INFO]make map tasks by files,len(files)=%d\n", len(files))
-	c.makeMapTasks(files)
-	// Your code here.
+	initLogCoordinator()
+	c.genTaskInfo()
 
+	go c.crashDetect()
 	c.server()
 
-	go c.CrashDetector()
-
 	return &c
+}
+
+func initLogCoordinator() {
+	logPath, _ := os.Getwd()
+	// 按照pid输出
+	logName := fmt.Sprintf("%s/coordinator.%d.%s.", logPath, os.Getpid(), time.Now().Format("20060102-150405"))
+	writer, _ := rotatelogs.New(logName + "%Y%m%d")
+	fileFormatter = &prefixed.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02.15:04:05.000000",
+		ForceFormatting: true,
+		DisableColors:   true,
+	}
+
+	logrus.SetFormatter(fileFormatter)
+	logrus.SetLevel(logrus.DebugLevel)
+	lfHook := lfshook.NewHook(lfshook.WriterMap{
+		logrus.InfoLevel:  writer,
+		logrus.DebugLevel: writer,
+		logrus.ErrorLevel: writer,
+		logrus.FatalLevel: writer,
+	}, fileFormatter)
+
+	logrus.AddHook(lfHook)
+	logrus.SetOutput(io.Discard)
+	logrus.Info("init log ....")
+}
+
+func marshal(v interface{}) string {
+	bytes, _ := json.Marshal(v)
+	return string(bytes)
+}
+
+func genTaskId() {
+	taskIdLock.Lock()
+	defer taskIdLock.Unlock()
+	TaskID++
 }
