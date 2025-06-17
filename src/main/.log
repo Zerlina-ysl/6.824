@@ -1,18 +1,20 @@
 go version go1.17.13 darwin/arm64
 *** Turning off -race since it may not work on a Mac
     with  go version go1.17.13 darwin/arm64
-*** Cannot find timeout command; proceeding without timeouts.
 *** Starting wc test.
+unexpected EOF
 --- wc test: PASS
 *** Starting indexer test.
+unexpected EOF
 --- indexer test: PASS
 *** Starting map parallelism test.
+unexpected EOF
 --- map parallelism test: PASS
 *** Starting reduce parallelism test.
---- too few parallel reduces.
---- reduce parallelism test: FAIL
+--- reduce parallelism test: PASS
+unexpected EOF
 *** Starting job count test.
 --- job count test: PASS
 *** Starting early exit test.
 --- early exit test: PASS
-*** Starting crash test.
+*** PASSED ALL 1 TESTING TRIALS

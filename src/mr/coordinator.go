@@ -1,20 +1,22 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+
 	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
 	"github.com/rifflock/lfshook"
 	"github.com/sirupsen/logrus"
 	prefixed "github.com/x-cray/logrus-prefixed-formatter"
-	"io"
-	"log"
-	"sync"
-	"time"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
 
 var TaskID int
 
@@ -45,16 +47,18 @@ const (
 type Task struct {
 	ID        int
 	File      string
-	startTime time.Time
-	status    TaskStatus
+	StartTime time.Time
+	Status    TaskStatus
 	TaskType  TaskType
 	ReduceNum int
 }
 
 var (
-	MapFinishTaskNum    = 0
-	ReduceFinishTaskNum = 0
-	calNumLock          sync.Mutex
+	calNumLock    sync.RWMutex
+	TIME_OUT      = 10 * time.Second
+	taskIdLock    sync.Mutex
+	taskInfoLock  sync.RWMutex
+	taskFinishMap = make(map[int]bool)
 )
 
 type Coordinator struct {
@@ -104,19 +108,21 @@ func (c *Coordinator) Done() bool {
 }
 
 func (c *Coordinator) genTaskInfo() {
+	taskList := make([]*Task, 0, len(c.files))
 	for _, file := range c.files {
 		task := &Task{
 			File:      file,
-			status:    Prepare,
+			Status:    Prepare,
 			ID:        TaskID,
 			TaskType:  MapTask,
 			ReduceNum: c.ReduceNum,
 		}
-		c.taskInfo[TaskID] = task
-		// 串行初始化，无需额外考虑并发问题
-		TaskID++
+		taskList = append(taskList, task)
+
+		genTaskId()
 		c.mapTaskChan <- task
 	}
+	c.setTask(taskList)
 }
 
 func (c *Coordinator) AssignTask(req *Task, reply *Task) error {
@@ -130,54 +136,78 @@ func (c *Coordinator) AssignTask(req *Task, reply *Task) error {
 	}
 	select {
 	case task := <-taskChan:
+		task.StartTime = time.Now()
+		task.Status = Running
+		c.setTask([]*Task{task})
 		*reply = *task
-
-		logrus.Infof("assign task ,task.ID:%v,task.Type:%v,task.File:%v,",
-			reply.ID, reply.TaskType, reply.File)
+		logrus.Info("assign task ,task:", task)
 	default:
-		time.Sleep(300 * time.Microsecond)
+		time.Sleep(100 * time.Microsecond)
 	}
 	return nil
 }
 
+func (c *Coordinator) setTask(tasks []*Task) {
+	taskInfoLock.Lock()
+	defer taskInfoLock.Unlock()
+	for _, task := range tasks {
+		c.taskInfo[task.ID] = task
+	}
+}
+
 func (c *Coordinator) FinishTask(req *Task, reply *Task) error {
+	if req.Status != Running {
+		return fmt.Errorf("task %v status is not Running", req.ID)
+	}
 	// 维护task状态
-	c.taskInfo[req.ID].status = Finish
+	req.Status = Finish
+	c.setTask([]*Task{req})
+	logrus.Infof("finish task ,task.ID:%v,StartTime:%v,currentPhase:%v,taskType:%v", req.ID, req.StartTime, c.phase, req.TaskType)
 
-	switch req.TaskType {
-	case MapTask:
-		calNumLock.Lock()
-		defer calNumLock.Unlock()
-		MapFinishTaskNum++
-	case ReduceTask:
-		calNumLock.Lock()
-		defer calNumLock.Unlock()
-		ReduceFinishTaskNum++
-	}
-	if len(c.files) == MapFinishTaskNum && c.phase == Map {
-		c.toNextPhase()
-	} else if c.ReduceNum == ReduceFinishTaskNum && c.phase == Reduce {
-		c.toNextPhase()
-	}
+	calNumLock.Lock()
+	taskFinishMap[req.ID] = true
+	calNumLock.Unlock()
 
-	logrus.Infof("markFinish---,mapFinishTask:%d,reduceFinishTask:%d,currentPhase:%d",
-		MapFinishTaskNum, ReduceFinishTaskNum, c.phase)
+	calNumLock.RLock()
+	defer calNumLock.RUnlock()
+
+	logrus.Infof("markFinish---,taskId:%v,finish:%v,currentPhase:%d",
+		req.ID, marshal(taskFinishMap), c.phase)
+	if c.phase == Map {
+		for i := 0; i < len(c.files); i++ {
+			if !taskFinishMap[i] {
+				return nil
+			}
+		}
+		c.toNextPhase()
+	} else if c.phase == Reduce {
+		for i := len(c.files); i < len(c.files)+c.ReduceNum; i++ {
+			if !taskFinishMap[i] {
+				return nil
+			}
+		}
+		c.toNextPhase()
+	}
 	return nil
 }
 
 func (c *Coordinator) toNextPhase() {
 	if c.phase == Map {
 		c.phase = Reduce
+		taskList := make([]*Task, 0, c.ReduceNum)
 		for i := 0; i < c.ReduceNum; i++ {
 			task := &Task{
 				TaskType:  ReduceTask,
 				ReduceNum: c.ReduceNum,
 				ID:        TaskID,
+				Status:    Prepare,
 			}
-			c.taskInfo[TaskID] = task
-			TaskID++
+			genTaskId()
+			taskList = append(taskList, task)
 			c.reduceTaskChan <- task
 		}
+
+		c.setTask(taskList)
 	} else if c.phase == Reduce {
 		c.phase = Done
 		c.doneTaskChan <- &Task{
@@ -185,7 +215,49 @@ func (c *Coordinator) toNextPhase() {
 			ID:       TaskID,
 		}
 	}
+	logrus.Infof("toNextPhase,phase:%v,finish:%v", c.phase, marshal(taskFinishMap))
+}
 
+func (c *Coordinator) crashDetect() {
+	for c.phase != Done {
+		time.Sleep(3 * time.Second)
+		overTimeTask := []*Task{}
+		taskInfoLock.RLock()
+		// 获取超时任务
+		for taskId := range c.taskInfo {
+			taskInfo := c.taskInfo[taskId]
+			//logrus.Debugf("taskId:%v,runningTime:%v", taskId, time.Now().Sub(taskInfo.StartTime))
+			if taskInfo.Status == Running && time.Now().Sub(taskInfo.StartTime) > TIME_OUT {
+				logrus.Infof("detect crash task,taskId:%v,holdTime:%v", taskId, time.Now().Sub(taskInfo.StartTime))
+				overTimeTask = append(overTimeTask, taskInfo)
+			}
+		}
+		taskInfoLock.RUnlock()
+
+		// 维护任务状态
+		for _, taskInfo := range overTimeTask {
+			taskInfo.Status = Prepare
+		}
+		c.setTask(overTimeTask)
+
+		// 重新推入chan
+		for _, taskInfo := range overTimeTask {
+			if taskInfo.TaskType == MapTask {
+				if c.phase == Reduce {
+					logrus.Errorf("error phase,error crash task,taskId:%v,phase:%v,task.Type:%v", taskInfo.ID, c.phase, taskInfo.TaskType)
+					continue
+				}
+				c.mapTaskChan <- taskInfo
+			} else if taskInfo.TaskType == ReduceTask {
+				if c.phase == Map {
+					logrus.Errorf("error phase,error crash task,taskId:%v,phase:%v,task.Type:%v", taskInfo.ID, c.phase, taskInfo.TaskType)
+					continue
+				}
+				c.reduceTaskChan <- taskInfo
+			}
+		}
+
+	}
 }
 
 //
@@ -206,7 +278,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	initLogCoordinator()
 	c.genTaskInfo()
 
+	go c.crashDetect()
 	c.server()
+
 	return &c
 }
 
@@ -214,16 +288,11 @@ func initLogCoordinator() {
 	logPath, _ := os.Getwd()
 	// 按照pid输出
 	logName := fmt.Sprintf("%s/coordinator.%d.%s.", logPath, os.Getpid(), time.Now().Format("20060102-150405"))
-	r, _ := rotatelogs.New(logName + "%Y%m%d")
-	mw := io.MultiWriter(r)
-	logrus.SetOutput(mw)
 	writer, _ := rotatelogs.New(logName + "%Y%m%d")
-
 	fileFormatter = &prefixed.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: "2006-01-02.15:04:05.000000",
 		ForceFormatting: true,
-		ForceColors:     true,
 		DisableColors:   true,
 	}
 
@@ -237,5 +306,17 @@ func initLogCoordinator() {
 	}, fileFormatter)
 
 	logrus.AddHook(lfHook)
+	logrus.SetOutput(io.Discard)
 	logrus.Info("init log ....")
+}
+
+func marshal(v interface{}) string {
+	bytes, _ := json.Marshal(v)
+	return string(bytes)
+}
+
+func genTaskId() {
+	taskIdLock.Lock()
+	defer taskIdLock.Unlock()
+	TaskID++
 }
