@@ -8,7 +8,10 @@ package raft
 // test with the original before submitting.
 //
 
-import "6.824/labgob"
+import (
+	"6.824/labgob"
+	"github.com/sirupsen/logrus"
+)
 import "6.824/labrpc"
 import "bytes"
 import "log"
@@ -444,6 +447,8 @@ func (cfg *config) checkOneLeader() int {
 		}
 
 		lastTermWithLeader := -1
+		logrus.Info("leader info:", leaders)
+
 		for term, leaders := range leaders {
 			if len(leaders) > 1 {
 				cfg.t.Fatalf("term %d has %d (>1) leaders", term, len(leaders))

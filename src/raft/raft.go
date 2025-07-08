@@ -28,6 +28,7 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	//	"bytes"
@@ -46,7 +47,10 @@ const (
 	Leader
 )
 
-var ()
+var (
+	startElectionGroup sync.WaitGroup
+	sendHeatbeatGroup  sync.WaitGroup
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -86,19 +90,18 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	term    int32
-	status  Status
-	voteFor int // vote for who,ensure each server will vote for at most one candidate in a given term
+	term                 int32
+	status               Status
+	voteFor              int // vote for who,ensure each server will vote for at most one candidate in a given term
+	resetElectionTimerCh chan bool
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return int(rf.term), rf.status == Leader
 }
 
 //
@@ -177,6 +180,7 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int32 // currentTerm, for candidate to update itself
 	VoteGranted bool  // true means candidate received vote
+	Msg         string
 }
 
 //
@@ -184,31 +188,36 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if rf.voteFor != -1 && rf.term == args.Term {
-		rf.logger.Infof("[%d] RequestVote# server %d voted for %d", rf.me, rf.me, rf.voteFor)
-		reply = &RequestVoteReply{
-			Term:        rf.term,
-			VoteGranted: false,
-		}
-		return
-	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.term
 
+	// 请求方term过时
 	if args.Term < rf.term {
-		rf.logger.Infof("[%d] RequestVote# server %d reject vote from %d becauseof term %d-%d", rf.me, rf.me, args.CandidateId, args.Term, rf.term)
-		reply = &RequestVoteReply{
-			Term:        rf.term,
-			VoteGranted: false,
-		}
+		rf.logger.Infof("RequestVote# server %d reject vote %d becauseof term %d-%d", rf.me, args.CandidateId, args.Term, rf.term)
+		reply.VoteGranted = false
+		reply.Msg = fmt.Sprintf("old term:%d less than %d", args.Term, rf.term)
 		return
 	}
 
-	rf.logger.Infof("[%d] RequestVote# server %d vote for %d", rf.me, rf.me, args.CandidateId)
-	rf.term = args.Term
-	rf.voteFor = args.CandidateId
-	reply = &RequestVoteReply{
-		Term:        rf.term,
-		VoteGranted: true,
+	// 给定term下至多只能投一次
+	if args.Term > rf.term {
+		rf.voteFor = -1
 	}
+
+	// 已投票
+	if rf.voteFor != -1 {
+		rf.logger.Infof("%d reject for %d because term %d votefor %d", rf.me, args.CandidateId, rf.term, rf.voteFor)
+		reply.VoteGranted = false
+		reply.Msg = fmt.Sprintf("voted for %d", rf.voteFor)
+		return
+	}
+
+	rf.voteFor = args.CandidateId
+	reply.VoteGranted = true
+	rf.term = args.Term
+
+	rf.logger.Infof("RequestVote# server %d vote for %d,reply:%v", rf.me, args.CandidateId, marshal(reply))
 	return
 }
 
@@ -241,13 +250,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	rf.logger.Infof("server %d send RequestVote to server %d,req:%v", rf.me, server, marshal(args))
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if ok {
-		rf.logger.Infof("[%d] Raft %d sendRequestVote to %d", rf.me, rf.me, server)
-	} else {
-		rf.logger.Warnf("[%d]  Raft %d sendRequestVote to %d fail", rf.me, rf.me, server)
-	}
+	rf.logger.Infof("sendRequestVote to %d,resp:%v", server, marshal(reply))
+	return ok
 }
 
 type AppendEntriesArgs struct {
@@ -261,34 +268,29 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.logger.Infof("recv AppendEntries from %d,args:%v", args.LeaderId, marshal(args))
+	reply.Term = rf.term
 	if args.Term < rf.term {
-		rf.logger.Infof("[%d] AppendEntries#args.Term:%d,currentTerm:%d", rf.me, args.Term, rf.term)
-		reply = &AppendEntriesReply{
-			Term:    rf.term,
-			Success: false,
-		}
+		rf.logger.Infof(" AppendEntries reject because req.term[%d] less than rf.term[%d]", args.Term, rf.term)
+		reply.Success = false
 		return
 	}
-
-	rf.logger.Infof("[%d] AppendEntries# returns to follower state.args,args:%s", rf.me, marshal(args))
+	rf.voteFor = -1
 	rf.status = Follower
 	rf.term = args.Term
-	rf.voteFor = -1
-	reply = &AppendEntriesReply{
-		Term:    args.Term,
-		Success: true,
-	}
+	reply.Term = rf.term
+	reply.Success = true
+	rf.logger.Infof("AppendEntries [%d] admit [%d]'s leader state in term[%d]", rf.me, args.LeaderId, rf.term)
+	rf.resetElectionTimer()
 	return
 
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.logger.Infof(" %d send heatbeat as leader to %d,req:%v", rf.me, server, marshal(args))
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok {
-		rf.logger.Infof("[%d] sendAppendEntries# to server:%d,args:%s,reply:%s", rf.me, server, marshal(args), marshal(reply))
-	} else {
-		rf.logger.Warnf("[%d] sendAppendEntries# to server:%d,args:%s,reply:%s", rf.me, server, marshal(args), marshal(reply))
-	}
+	rf.logger.Infof(" %d send heatbeat as leader to %d,resp:%v,succ:%v", rf.me, server, marshal(reply), ok)
+	return ok
 }
 
 //
@@ -347,22 +349,48 @@ func (rf *Raft) ticker() {
 
 		switch rf.status {
 		case Follower:
-			rf.logger.Infof("[%d] raft %d is follower", rf.me, rf.me)
+			rf.logger.Info(rf.me, " is follower")
 			// 超时发起选举 150-300ms
 			randomElectionTimeout := time.Duration(rand.Intn(150)+150) * time.Millisecond
-			timeout, _ := context.WithTimeout(context.Background(), randomElectionTimeout)
+			//timeout, _ := context.WithTimeout(context.Background(), randomElectionTimeout)
+			timer := time.NewTimer(randomElectionTimeout)
 			select {
-			case <-timeout.Done():
+			case <-timer.C:
+				rf.logger.Infof("no heatbeat longtime,[%d] change to candidate", rf.me)
 				rf.status = Candidate
+				rf.voteFor = -1
+			case <-rf.resetElectionTimerCh:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				rf.logger.Infof("receive heatbeat")
 			}
 		case Candidate:
-			rf.logger.Infof("[%d] raft %d is candidate", rf.me, rf.me)
-			// 发起投票
-			rf.startElection()
+			rf.logger.Info(rf.me, " is candidate", rf.voteFor)
+			rf.mu.Lock()
+			currentTerm := rf.term
+			rf.mu.Unlock()
+			// 在一个 Term 内最多只能投一票
+			if rf.voteFor == -1 {
+				rf.startElection()
+			}
+			// 发起选举后等待一个选举周期
+			time.Sleep(time.Duration(rand.Intn(150)+150) * time.Millisecond)
+			rf.mu.Lock()
+			if rf.term != currentTerm || rf.status != Candidate {
+				rf.mu.Unlock()
+				continue // Term 改变或不再是 Candidate，不再继续选举
+			}
+			rf.mu.Unlock()
+
 		case Leader:
-			rf.logger.Infof("[%d] raft %d is leader", rf.me, rf.me)
-			// 发送心跳
-			rf.sendHeartbeat()
+			rf.logger.Info(rf.me, "is Leader")
+			for rf.status == Leader {
+				// 发送心跳
+				rf.sendHeartbeat()
+				// no more than ten times per second.
+				time.Sleep(100 * time.Millisecond)
+			}
 
 		}
 
@@ -370,46 +398,93 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) startElection() {
-	rf.logger.Infof("[%d]  start election,term:%d", rf.me, rf.term)
-	rf.term++
-	var receiveVotes int32
+	ctx, cancel := context.WithCancel(context.Background())
+	rf.mu.Lock()
+	rf.term = rf.term + 1
+	rf.voteFor = rf.me // 投自己一票
+	rf.mu.Unlock()
+	rf.logger.Infof("[%d] entering election with term=%d", rf.me, rf.term)
+	var receiveVotes = int32(1)
 	for i := range rf.peers {
 		if i == rf.me {
-			// 投自己一票
-			rf.voteFor = rf.me
-			receiveVotes++
 			continue
 		}
+		startElectionGroup.Add(1)
 		go func(server int) {
-			reply := &RequestVoteReply{}
-			rf.sendRequestVote(server,
-				&RequestVoteArgs{},
-				reply)
-			if reply.VoteGranted {
-				// 收到投票
-				atomic.AddInt32(&receiveVotes, 1)
-				if int(atomic.LoadInt32(&receiveVotes)) > len(rf.peers)/2 {
-					// 获得大多数投票
-					rf.status = Leader
+			if server == rf.me {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				reply := &RequestVoteReply{}
+				succ := rf.sendRequestVote(server,
+					&RequestVoteArgs{
+						Term:        rf.term,
+						CandidateId: rf.me,
+					},
+					reply)
+				startElectionGroup.Done()
+				if !succ {
+					rf.logger.Warnf("[%d] sendRequestVote to [%d] failed", rf.me, server)
+					return
+				}
+				if reply.VoteGranted {
+					// 收到投票
+					atomic.AddInt32(&receiveVotes, 1)
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					rf.logger.Infof("current term:%d,receive vote count:%d,latest vote from %d", rf.term, atomic.LoadInt32(&receiveVotes), server)
+					if int(atomic.LoadInt32(&receiveVotes)) >= len(rf.peers)/2 {
+						rf.status = Leader
+						rf.voteFor = -1
+						rf.sendHeartbeat()
+						rf.logger.Infof(" [%d] change to leader!term:%d", rf.me, rf.term)
+						cancel()
+					}
+				} else if strings.Contains(reply.Msg, "old term") {
+					// term过时，退出选举，更新term
+					rf.mu.Lock()
+					rf.status = Follower
+					rf.term = reply.Term
+					rf.voteFor = -1
+					rf.mu.Unlock()
+					cancel()
+					rf.logger.Infof("node[%d] received higher term=%d in vote response, stepping down", rf.me, reply.Term)
 				}
 			}
 		}(i)
-
 	}
+	startElectionGroup.Wait()
+
 }
 
 func (rf *Raft) sendHeartbeat() {
 	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		//sendHeatbeatGroup.Add(1)
 		go func(server int) {
 			reply := &AppendEntriesReply{}
-			rf.sendAppendEntries(server, &AppendEntriesArgs{}, reply)
+			succ := rf.sendAppendEntries(server, &AppendEntriesArgs{
+				Term:     rf.term,
+				LeaderId: rf.me,
+			}, reply)
+			//sendHeatbeatGroup.Done()
+			if !succ {
+				rf.logger.Infof(" [%d] send heartbeat to [%d] failed", rf.me, server)
+				return
+			}
 			if !reply.Success {
+				rf.logger.Info(rf.me, "change to follower")
 				rf.status = Follower
 				rf.term = reply.Term
 			}
-
 		}(i)
 	}
+	//sendHeatbeatGroup.Wait()
 
 }
 
@@ -442,6 +517,11 @@ func (rf *Raft) initLog() {
 	rf.logger.Infof("[%d]init log ....", rf.me)
 }
 
+func (rf *Raft) resetElectionTimer() {
+	rf.resetElectionTimerCh <- true
+
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -461,6 +541,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.status = Follower
+	rf.voteFor = -1
+	rf.resetElectionTimerCh = make(chan bool, 1)
 
 	rf.initLog()
 
