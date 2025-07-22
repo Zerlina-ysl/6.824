@@ -12,3 +12,4 @@ mrtmp.*
 /main/mrworker
 ../../.DS_Store
 ../.idea/
+/raft/tmp
