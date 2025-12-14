@@ -154,6 +154,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 	}
 	_, prevok := cfg.logs[i][m.CommandIndex-1]
 	cfg.logs[i][m.CommandIndex] = v
+	//fmt.Println("cfg.logs", cfg.logs)
 	if m.CommandIndex > cfg.maxIndex {
 		cfg.maxIndex = m.CommandIndex
 	}
@@ -164,6 +165,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 // contents
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
+		//fmt.Println("applier", i, m)
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
@@ -504,6 +506,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
 		cfg.mu.Unlock()
+		//fmt.Println("nCommitted==", cfg.logs, i, index, cmd1)
 
 		if ok {
 			if count > 0 && cmd != cmd1 {
