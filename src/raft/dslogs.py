@@ -92,7 +92,7 @@ def main(
             else:
                 cols = ["" for _ in range(n_columns)]
                 msg = "" + msg
-                cols[i] = msg
+                cols[i] = time+" "+msg
                 col_width = int(width / n_columns)
                 cols = Columns(cols, width=col_width - 1, equal=True, expand=True)
                 print(cols)
