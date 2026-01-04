@@ -506,9 +506,9 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cfg.mu.Lock()
 		cmd1, ok := cfg.logs[i][index]
 		cfg.mu.Unlock()
-		//fmt.Println("nCommitted==", cfg.logs, i, index, cmd1)
 
 		if ok {
+			//fmt.Println("nCommitted==", cfg.logs, i, index, cmd1)
 			if count > 0 && cmd != cmd1 {
 				cfg.t.Fatalf("committed values do not match: index %v, %v, %v",
 					index, cmd, cmd1)
@@ -578,6 +578,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			}
 			cfg.mu.Unlock()
 			if rf != nil {
+				//fmt.Printf("S%d starting Apply(%v)\n", starts, cmd)
 				index1, _, ok := rf.Start(cmd)
 				if ok {
 					index = index1
@@ -599,6 +600,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 						return index
 					}
 				}
+				//fmt.Println(cmd, "committed with command", cmd1, "expected", expectedServers)
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {

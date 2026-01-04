@@ -83,7 +83,7 @@ type Raft struct {
 	voteFor              int // vote for who,ensure each server will vote for at most one candidate in a given term
 	resetElectionTimerCh chan bool
 
-	commitIndex int32   // index of highest log entry known to be committed
+	commitIndex int32   // index of highest log entry known to be committed，成功同步至follower后更新
 	logEntries  []Entry // 下标为idx，logEntries[i]为第i个log entry
 	lastApplied int     // index of highest log entry applied to state machine
 
@@ -276,9 +276,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int32
-	Success bool
-	Msg     string
+	Term       int32
+	Success    bool
+	Msg        string
+	CurrentIdx int // 渐进回退较慢，当idx冲突时，follower直接返回冲突的索引
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -313,6 +314,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.me, args.LeaderId)
 		reply.Success = false
 		reply.Msg = INCONSISTENCE_MSG
+		// 找到冲突的索引
+		reply.CurrentIdx = len(rf.logEntries) - 1
 		return
 	}
 	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it (§5.3)
@@ -473,6 +476,7 @@ func (rf *Raft) startElection() {
 	rf.term = rf.term + 1
 	rf.voteFor = rf.me // 投自己一票
 	PrettyDebug(dTimer, "S%v entering election with term=%d", rf.me, rf.term)
+	failCount := 0
 	rf.mu.Unlock()
 
 	var receiveVotes = int32(1)
@@ -497,11 +501,17 @@ func (rf *Raft) startElection() {
 				req,
 				reply)
 
+			rf.mu.Lock()
 			if !succ {
+				failCount++
+				if failCount >= len(rf.peers)/2+1 {
+					rf.status = Follower
+					rf.voteFor = -1
+					PrettyDebug(dInfo, "S%v change to follower!term:%d", rf.me, rf.term)
+				}
 				PrettyDebug(dWarn, "S%v->%d sendRequestVote failed", rf.me, server)
 				return
 			}
-			rf.mu.Lock()
 			if reply.VoteGranted {
 				// 收到投票
 				atomic.AddInt32(&receiveVotes, 1)
@@ -566,8 +576,8 @@ func (rf *Raft) commitMsg(ch chan ApplyMsg) {
 					CommandValid: true,
 				}
 				rf.lastApplied = i
-				PrettyDebug(dInfo, "S%v lastApplied:%v,commitIndex:%v,commit log:%v",
-					rf.me, rf.lastApplied, rf.commitIndex, marshal(rf.logEntries[i]))
+				PrettyDebug(dInfo, "S%v %v commit to state machine succ",
+					rf.me, rf.logEntries[i].Command)
 				ch <- msg
 			}
 		}
@@ -592,7 +602,7 @@ func (rf *Raft) startReplicators() {
 
 func (rf *Raft) startReplicator(server int) {
 	for !rf.killed() {
-		PrettyDebug(dInfo, "S%v startReplicator", rf.me)
+		PrettyDebug(dInfo, "S%v->%v startReplicator", rf.me, server)
 		if rf.getCurrentStatus() != Leader {
 			return
 		}
@@ -601,7 +611,7 @@ func (rf *Raft) startReplicator(server int) {
 		if prevLogIdx >= len(rf.logEntries) || prevLogIdx < 0 {
 			rf.mu.Unlock()
 			PrettyDebug(dWarn, "S%v startReplicator, prevLogIdx:%v,logEntries.len:%v", rf.me, prevLogIdx, len(rf.logEntries))
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		prevLogItem := rf.logEntries[prevLogIdx]
@@ -639,7 +649,7 @@ func (rf *Raft) startReplicator(server int) {
 				continue
 			}
 			if rf.nextIndex[server] > 1 {
-				rf.nextIndex[server]--
+				rf.nextIndex[server] = reply.CurrentIdx
 				PrettyDebug(dWarn, "S%v->%v  sync log failed, retry, nextIndex:%v", rf.me, server, rf.nextIndex[server])
 			}
 		}
@@ -667,7 +677,7 @@ func (rf *Raft) dealCommitIndex() {
 			}
 		}
 		PrettyDebug(dInfo, "S%v dealCommitIndex, i:%v,count:%v", rf.me, i, count)
-		if count > len(rf.peers)/2+1 {
+		if count >= len(rf.peers)/2+1 {
 			rf.commitIndex = int32(i)
 			PrettyDebug(dInfo, "S%v commitIndex:%v", rf.me, rf.commitIndex)
 			break

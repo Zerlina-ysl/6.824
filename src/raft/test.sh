@@ -1,20 +1,25 @@
+#!/bin/bash
 
+   VERBOSE=1 go test -v *.go  -test.run=TestBackup2B  | python dslogs.py -c 5 > log
+
+exit
 times=${1:-1}
-for ((i=1;i<=$times;i++))
+for ((i=1; i<=$times; i++))
 do
-#  rm -f tmp/*
-# VERBOSE=1 go test -v *.go  -test.run=TestInitialElection2A | python dslogs.py -c 3 > log1
-# VERBOSE=1 go test -v *.go  -test.run=TestReElection2A | python dslogs.py -c 3 > log1
-# VERBOSE=1 go test -v *.go  -test.run=TestManyElections2A | python dslogs.py -c 3 > log1
+    echo "Running test iteration $i..."
 
+     go test -v -run=".*2A.*" 2>&1 | python dslogs.py -c 3 | tee test_output.log
+     if [ ${PIPESTATUS[0]} -ne 0 ]; then
+         echo "Test with 2A failed, stopping..."
+         exit 1
+     fi
 
-# VERBOSE=1 go test -v *.go  -test.run=TestBasicAgree2B | python dslogs.py -c 3 > log1
-#VERBOSE=1 go test -v *.go  -test.run=TestRPCBytes2B | python dslogs.py -c 3 > log1
-
-VERBOSE=1 go test -v *.go  -test.run=TestFailAgree2B | python dslogs.py -c 3 > log1
-#  if grep -q "FAIL:" /tmp/test_output.log; then
-#     exit 1
-#  fi
+     go test -v -run=".*2B.*" 2>&1 | python dslogs.py -c 3 | tee test_output.log
+     if [ ${PIPESTATUS[0]} -ne 0 ]; then
+         echo "Test with 2B failed, stopping..."
+         exit 1
+     fi
 
 done
 
+echo "All tests completed successfully!"
